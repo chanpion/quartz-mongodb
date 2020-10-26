@@ -1,15 +1,19 @@
 package com.novemberain.quartz.mongodb.dao;
 
-import com.mongodb.client.MongoCollection;
-import com.mongodb.client.model.Filters;
-import com.mongodb.client.model.IndexOptions;
-import com.mongodb.client.model.Projections;
-import com.novemberain.quartz.mongodb.util.SerialUtils;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 import org.bson.types.Binary;
 import org.quartz.Calendar;
 import org.quartz.JobPersistenceException;
+
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.IndexOptions;
+import com.mongodb.client.model.Projections;
+import com.novemberain.quartz.mongodb.util.SerialUtils;
+
+import java.util.LinkedList;
+import java.util.List;
 
 public class CalendarDao {
 
@@ -27,9 +31,7 @@ public class CalendarDao {
     }
 
     public void createIndex() {
-        calendarCollection.createIndex(
-                Projections.include(CALENDAR_NAME),
-                new IndexOptions().unique(true));
+        calendarCollection.createIndex(Projections.include(CALENDAR_NAME), new IndexOptions().unique(true));
     }
 
     public MongoCollection<Document> getCollection() {
@@ -37,12 +39,12 @@ public class CalendarDao {
     }
 
     public int getCount() {
-        return (int) calendarCollection.count();
+        return (int) calendarCollection.countDocuments();
     }
 
     public boolean remove(String name) {
         Bson searchObj = Filters.eq(CALENDAR_NAME, name);
-        if (calendarCollection.count(searchObj) > 0) {
+        if (calendarCollection.countDocuments(searchObj) > 0) {
             calendarCollection.deleteMany(searchObj);
             return true;
         }
@@ -60,10 +62,18 @@ public class CalendarDao {
         }
         return null;
     }
-    
+
     public void store(String name, Calendar calendar) throws JobPersistenceException {
         Document doc = new Document(CALENDAR_NAME, name)
-                .append(CALENDAR_SERIALIZED_OBJECT, SerialUtils.serialize(calendar));
+            .append(CALENDAR_SERIALIZED_OBJECT, SerialUtils.serialize(calendar));
         calendarCollection.insertOne(doc);
+    }
+
+    public List<String> retrieveCalendarNames() {
+        return calendarCollection
+                .find()
+                .projection(Projections.include(CALENDAR_NAME))
+                .map(document -> document.getString(CALENDAR_NAME))
+                .into(new LinkedList<>());
     }
 }

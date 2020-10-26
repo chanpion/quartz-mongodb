@@ -9,9 +9,9 @@
  */
 package com.novemberain.quartz.mongodb;
 
-import com.mongodb.MongoClient;
 import com.mongodb.MongoCommandException;
 import com.mongodb.MongoException;
+import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.novemberain.quartz.mongodb.db.MongoConnector;
@@ -24,9 +24,14 @@ import org.quartz.Trigger.TriggerState;
 import org.quartz.impl.matchers.GroupMatcher;
 import org.quartz.spi.*;
 
+import java.io.BufferedInputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.*;
 import java.util.Map.Entry;
+import java.util.concurrent.TimeUnit;
 
 public class MongoDBJobStore implements JobStore, Constants {
 
@@ -50,17 +55,25 @@ public class MongoDBJobStore implements JobStore, Constants {
     private boolean clustered = false;
     long clusterCheckinIntervalMillis = 7500;
     boolean jobDataAsBase64 = true;
+    String checkInErrorHandler = null;
 
     // Options for the Mongo client.
     Boolean mongoOptionSocketKeepAlive;
-    Integer mongoOptionMaxConnectionsPerHost;
+    Integer mongoOptionMaxConnections;
     Integer mongoOptionConnectTimeoutMillis;
-    Integer mongoOptionSocketTimeoutMillis; // read timeout
-    Integer mongoOptionThreadsAllowedToBlockForConnectionMultiplier;
+    Integer mongoOptionReadTimeoutMillis; // read timeout
     Boolean mongoOptionEnableSSL;
     Boolean mongoOptionSslInvalidHostNameAllowed;
+    String mongoOptionTrustStorePath;
+    String mongoOptionTrustStorePassword;
+    String mongoOptionTrustStoreType;
+    String mongoOptionKeyStorePath;
+    String mongoOptionKeyStorePassword;
+    String mongoOptionKeyStoreType;
 
     int mongoOptionWriteConcernTimeoutMillis = 5000;
+    String mongoOptionWriteConcernW;
+    public static final String PROPERTIES_FILE_NAME = "quartz.properties";
 
     public MongoDBJobStore() {
     }
@@ -85,7 +98,8 @@ public class MongoDBJobStore implements JobStore, Constants {
 
     /**
      * Override to change class loading mechanism, to e.g. dynamic
-     * @param original    default provided by Quartz
+     *
+     * @param original default provided by Quartz
      * @return loader to use for loading of Quartz Jobs' classes
      */
     protected ClassLoadHelper getClassLoaderHelper(ClassLoadHelper original) {
@@ -95,12 +109,7 @@ public class MongoDBJobStore implements JobStore, Constants {
     @Override
     public void initialize(ClassLoadHelper loadHelper, SchedulerSignaler signaler)
             throws SchedulerConfigException {
-        Properties props = new Properties();
-        try {
-            props.load(loadHelper.getClassLoader().getResourceAsStream("quartz.properties"));
-        } catch (IOException e) {
-            // ignore
-        }
+        Properties props = loadProperties(loadHelper);
         try {
             assembler.build(this, loadHelper, signaler, props);
         } catch (ClassNotFoundException | IllegalAccessException | InstantiationException e) {
@@ -117,6 +126,27 @@ public class MongoDBJobStore implements JobStore, Constants {
         }
 
         ensureIndexes();
+    }
+
+    private Properties loadProperties(ClassLoadHelper loadHelper) {
+        Properties props = new Properties();
+        File propFile = new File(PROPERTIES_FILE_NAME);
+        InputStream is = null;
+        // this roughly mimics how StdSchedulerFactory#initialize() fills properties in
+        try {
+            if (propFile.exists()) {
+                is = new BufferedInputStream(new FileInputStream(PROPERTIES_FILE_NAME));
+                props.load(is);
+            } else {
+                is = loadHelper.getClassLoader().getResourceAsStream(PROPERTIES_FILE_NAME);
+                if (is != null) {
+                    props.load(is);
+                }
+            }
+        } catch (IOException e) {
+            // ignore
+        }
+        return props;
     }
 
     @Override
@@ -150,6 +180,11 @@ public class MongoDBJobStore implements JobStore, Constants {
         return 200;
     }
 
+    @Override
+    public long getAcquireRetryDelay(int failureCount) {
+        return mongo.getClusterDescription().getClusterSettings().getServerSelectionTimeout(TimeUnit.MILLISECONDS);
+    }
+
     /**
      * Set whether this instance is part of a cluster.
      */
@@ -165,7 +200,7 @@ public class MongoDBJobStore implements JobStore, Constants {
     /**
      * Set the frequency (in milliseconds) at which this instance "checks-in"
      * with the other instances of the cluster.
-     *
+     * <p>
      * Affects the rate of detecting failed instances.
      */
     public void setClusterCheckinInterval(long clusterCheckinInterval) {
@@ -199,6 +234,14 @@ public class MongoDBJobStore implements JobStore, Constants {
         this.jobDataAsBase64 = jobDataAsBase64;
     }
 
+    public String getCheckInErrorHandler() {
+        return checkInErrorHandler;
+    }
+
+    public void setCheckInErrorHandler(String checkInErrorHandler) {
+        this.checkInErrorHandler = checkInErrorHandler;
+    }
+
     /**
      * Job and Trigger storage Methods
      */
@@ -224,10 +267,10 @@ public class MongoDBJobStore implements JobStore, Constants {
             assembler.jobDao.storeJobInMongo(newJob, replace);
 
             // Store all triggers of the job.
-            for(Trigger newTrigger: triggers) {
+            for (Trigger newTrigger : triggers) {
                 // Simply cast to OperableTrigger as in QuartzScheduler.scheduleJobs
                 // http://www.programcreek.com/java-api-examples/index.php?api=org.quartz.spi.OperableTrigger
-                assembler.persister.storeTrigger((OperableTrigger)newTrigger, replace);
+                assembler.persister.storeTrigger((OperableTrigger) newTrigger, replace);
             }
         }
     }
@@ -350,7 +393,7 @@ public class MongoDBJobStore implements JobStore, Constants {
 
     @Override
     public List<String> getCalendarNames() throws JobPersistenceException {
-        throw new UnsupportedOperationException();
+        return assembler.calendarDao.retrieveCalendarNames();
     }
 
     @Override
@@ -435,6 +478,11 @@ public class MongoDBJobStore implements JobStore, Constants {
     }
 
     @Override
+    public void resetTriggerFromErrorState(TriggerKey triggerKey) {
+        assembler.triggerStateManager.resetTriggerFromErrorState(triggerKey);
+    }
+
+    @Override
     public List<TriggerFiredResult> triggersFired(List<OperableTrigger> triggers)
             throws JobPersistenceException {
         return assembler.triggerRunner.triggersFired(triggers);
@@ -442,7 +490,7 @@ public class MongoDBJobStore implements JobStore, Constants {
 
     @Override
     public void triggeredJobComplete(OperableTrigger trigger, JobDetail job,
-                              CompletedExecutionInstruction triggerInstCode) {
+                                     CompletedExecutionInstruction triggerInstCode) {
         assembler.jobCompleteHandler.jobComplete(trigger, job, triggerInstCode);
     }
 
@@ -525,14 +573,14 @@ public class MongoDBJobStore implements JobStore, Constants {
      */
     private void ensureIndexes() throws SchedulerConfigException {
         try {
-      /*
-       * Indexes are to be declared as group then name.  This is important as the quartz API allows
-       * for the searching of jobs and triggers using a group matcher.  To be able to use the compound
-       * index using group alone (as the API allows), group must be the first key in that index.
-       * 
-       * To be consistent, all such indexes are ensured in the order group then name.  The previous
-       * indexes are removed after we have "ensured" the new ones.
-       */
+            /*
+             * Indexes are to be declared as group then name.  This is important as the quartz API allows
+             * for the searching of jobs and triggers using a group matcher.  To be able to use the compound
+             * index using group alone (as the API allows), group must be the first key in that index.
+             *
+             * To be consistent, all such indexes are ensured in the order group then name.  The previous
+             * indexes are removed after we have "ensured" the new ones.
+             */
 
             assembler.jobDao.createIndex();
             assembler.triggerDao.createIndex();
@@ -553,20 +601,16 @@ public class MongoDBJobStore implements JobStore, Constants {
         }
     }
 
-    public void setMongoOptionMaxConnectionsPerHost(int maxConnectionsPerHost) {
-        this.mongoOptionMaxConnectionsPerHost = maxConnectionsPerHost;
+    public void setMongoOptionMaxConnections(int maxConnections) {
+        this.mongoOptionMaxConnections = maxConnections;
     }
 
     public void setMongoOptionConnectTimeoutMillis(int maxConnectWaitTime) {
         this.mongoOptionConnectTimeoutMillis = maxConnectWaitTime;
     }
 
-    public void setMongoOptionSocketTimeoutMillis(int socketTimeoutMillis) {
-        this.mongoOptionSocketTimeoutMillis = socketTimeoutMillis;
-    }
-
-    public void setMongoOptionThreadsAllowedToBlockForConnectionMultiplier(int threadsAllowedToBlockForConnectionMultiplier) {
-        this.mongoOptionThreadsAllowedToBlockForConnectionMultiplier = threadsAllowedToBlockForConnectionMultiplier;
+    public void setMongoOptionReadTimeoutMillis(int readTimeoutMillis) {
+        this.mongoOptionReadTimeoutMillis = readTimeoutMillis;
     }
 
     public void setMongoOptionSocketKeepAlive(boolean socketKeepAlive) {
@@ -579,6 +623,34 @@ public class MongoDBJobStore implements JobStore, Constants {
 
     public void setMongoOptionSslInvalidHostNameAllowed(boolean sslInvalidHostNameAllowed) {
         this.mongoOptionSslInvalidHostNameAllowed = sslInvalidHostNameAllowed;
+    }
+
+    public void setMongoOptionTrustStorePath(String trustStorePath) {
+        this.mongoOptionTrustStorePath = trustStorePath;
+    }
+
+    public void setMongoOptionTrustStorePassword(String trustStorePassword) {
+        this.mongoOptionTrustStorePassword = trustStorePassword;
+    }
+
+    public void setMongoOptionTrustStoreType(String trustStoreType) {
+        this.mongoOptionTrustStoreType = trustStoreType;
+    }
+
+    public void setMongoOptionKeyStorePath(String keyStorePath) {
+        this.mongoOptionKeyStorePath = keyStorePath;
+    }
+
+    public void setMongoOptionKeyStorePassword(String keyStorePassword) {
+        this.mongoOptionKeyStorePassword = keyStorePassword;
+    }
+
+    public void setMongoOptionKeyStoreType(String keyStoreType) {
+        this.mongoOptionKeyStoreType = keyStoreType;
+    }
+
+    public void setMongoOptionWriteConcernW(String mongoOptionWriteConcernW) {
+        this.mongoOptionWriteConcernW = mongoOptionWriteConcernW;
     }
 
     public void setMongoOptionWriteConcernTimeoutMillis(int writeConcernTimeoutMillis) {

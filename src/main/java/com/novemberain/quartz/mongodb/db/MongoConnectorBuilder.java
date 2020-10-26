@@ -1,14 +1,18 @@
 package com.novemberain.quartz.mongodb.db;
 
 import com.mongodb.*;
+import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoDatabase;
 import org.quartz.SchedulerConfigException;
 
+import java.net.URI;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLException;
 
 /**
  * Builder for {@link MongoConnector}.
@@ -17,7 +21,8 @@ public class MongoConnectorBuilder {
 
     private static final String PARAM_NOT_ALLOWED = "'%s' parameter is not allowed. %s";
     private MongoConnector connector;
-    private Integer writeTimeout;
+    private String writeConcernW;
+    private Integer writeConcernWriteTimeout;
     private MongoDatabase database;
     private MongoClient client;
     private String dbName;
@@ -26,13 +31,19 @@ public class MongoConnectorBuilder {
     private String username;
     private String password;
     private String authDbName;
-    private Integer maxConnectionsPerHost;
+    private Integer maxConnections;
     private Integer connectTimeoutMillis;
-    private Integer socketTimeoutMillis;
+    private Integer readTimeoutMillis;
     private Boolean socketKeepAlive;
-    private Integer threadsAllowedToBlockForConnectionMultiplier;
     private Boolean enableSSL;
     private Boolean sslInvalidHostNameAllowed;
+    private String trustStorePath;
+    private String trustStorePassword;
+    private String trustStoreType;
+    private String keyStorePath;
+    private String keyStorePassword;
+    private String keyStoreType;
+    private SSLContextFactory sslContextFactory = new SSLContextFactory();
 
     /**
      * Use {@link #builder()}.
@@ -72,7 +83,8 @@ public class MongoConnectorBuilder {
         }
 
         // Options below require database name
-        checkNotNull(dbName, "'Database name' parameter is required.");
+        resolveDbNameByUriIfNull();
+        checkNotNull(dbName, "'Database name' is required, as parameter or in MongoDB URI path.");
 
         if (client != null) {
             // User passed MongoClient instance.
@@ -80,17 +92,26 @@ public class MongoConnectorBuilder {
             return new ExternalMongoConnector(writeConcern, client, dbName);
         }
 
+        final MongoClientSettings.Builder settingsBuilder = createSettingsBuilder();
         if (uri != null) {
             // User passed URI.
             validateForUri();
-            return new InternalMongoConnector(writeConcern, uri, dbName);
+            return new InternalMongoConnector(writeConcern, uri, dbName, settingsBuilder);
         }
 
         checkNotNull(addresses, "At least one MongoDB address or a MongoDB URI must be specified.");
         final List<ServerAddress> serverAddresses = collectServerAddresses();
         final Optional<MongoCredential> credentials = createCredentials();
-        final MongoClientOptions options = createOptions();
-        return new InternalMongoConnector(writeConcern, serverAddresses, credentials, options, dbName);
+        return new InternalMongoConnector(writeConcern, serverAddresses, credentials, settingsBuilder, dbName);
+    }
+
+    private void resolveDbNameByUriIfNull() {
+        if (dbName == null && uri != null) {
+            String path = URI.create(uri).getPath();
+            if (path != null && path.startsWith("/") && path.length() > 1) {
+                dbName = path.substring(1);
+            }
+        }
     }
 
     private List<ServerAddress> collectServerAddresses() {
@@ -116,34 +137,58 @@ public class MongoConnectorBuilder {
         return Optional.empty();
     }
 
-    private MongoClientOptions createOptions() {
-        final MongoClientOptions.Builder optionsBuilder = MongoClientOptions.builder();
-        if (maxConnectionsPerHost != null) {
-            optionsBuilder.connectionsPerHost(maxConnectionsPerHost);
+    private MongoClientSettings.Builder createSettingsBuilder() throws SchedulerConfigException {
+        final MongoClientSettings.Builder settingsBuilder = MongoClientSettings.builder();
+        if (maxConnections != null) {
+            settingsBuilder.applyToConnectionPoolSettings(builder -> builder.maxSize(maxConnections));
         }
         if (connectTimeoutMillis != null) {
-            optionsBuilder.connectTimeout(connectTimeoutMillis);
+            settingsBuilder.applyToSocketSettings(builder -> builder.connectTimeout(connectTimeoutMillis, TimeUnit.MILLISECONDS));
         }
-        if (socketTimeoutMillis != null) {
-            optionsBuilder.socketTimeout(socketTimeoutMillis);
+        if (readTimeoutMillis != null) {
+            settingsBuilder.applyToSocketSettings(builder -> builder.readTimeout(readTimeoutMillis, TimeUnit.MILLISECONDS));
         }
         if (socketKeepAlive != null) {
             // enabled by default,
             // ignored per MongoDB Java client deprecations
         }
-        if (threadsAllowedToBlockForConnectionMultiplier != null) {
-            optionsBuilder.threadsAllowedToBlockForConnectionMultiplier(threadsAllowedToBlockForConnectionMultiplier);
-        }
-        if (enableSSL != null) {
-            optionsBuilder.sslEnabled(enableSSL);
-            if (sslInvalidHostNameAllowed != null) {
-                optionsBuilder.sslInvalidHostNameAllowed(sslInvalidHostNameAllowed);
+        hanldeSSLContext(settingsBuilder);
+        return settingsBuilder;
+    }
+
+    private void hanldeSSLContext(MongoClientSettings.Builder optionsBuilder) throws SchedulerConfigException {
+        try {
+            SSLContext sslContext = sslContextFactory.getSSLContext(trustStorePath, trustStorePassword, trustStoreType,
+                    keyStorePath, keyStorePassword, keyStoreType);
+            if (sslContext == null) {
+                if (enableSSL != null) {
+                    optionsBuilder.applyToSslSettings(builder -> builder.enabled(enableSSL));
+                    if (sslInvalidHostNameAllowed != null) {
+                        optionsBuilder.applyToSslSettings(builder -> builder.invalidHostNameAllowed(sslInvalidHostNameAllowed));
+                    }
+                }
+            } else {
+                optionsBuilder.applyToSslSettings(builder -> builder.enabled(true));
+                if (sslInvalidHostNameAllowed != null) {
+                    optionsBuilder.applyToSslSettings(builder -> builder.invalidHostNameAllowed(sslInvalidHostNameAllowed));
+                }
+                optionsBuilder.applyToSslSettings(builder -> builder.context(sslContext));
             }
+        } catch (SSLException e) {
+            throw new SchedulerConfigException("Cannot setup SSL context", e);
         }
-        return optionsBuilder.build();
     }
 
     private WriteConcern createWriteConcern() throws SchedulerConfigException {
+        checkNotNull(writeConcernWriteTimeout, "Write timeout is expected.");
+
+        if(writeConcernW != null) {
+            return WriteConcern.valueOf(writeConcernW)
+               .withWTimeout(writeConcernWriteTimeout, TimeUnit.MILLISECONDS)
+               .withJournal(true);
+        }
+
+        // Default:
         // Use MAJORITY to make sure that writes (locks, updates, check-ins)
         // are propagated to secondaries in a Replica Set. It allows us to
         // have consistent state in case of failure of the primary.
@@ -151,8 +196,7 @@ public class MongoConnectorBuilder {
         // Since MongoDB 3.2, when MAJORITY is used and protocol version == 1
         // for replica set, then Journaling in enabled by default for primary
         // and secondaries.
-        checkNotNull(writeTimeout, "Write timeout is expected.");
-        return WriteConcern.MAJORITY.withWTimeout(writeTimeout, TimeUnit.MILLISECONDS)
+        return WriteConcern.MAJORITY.withWTimeout(writeConcernWriteTimeout, TimeUnit.MILLISECONDS)
                 .withJournal(true);
     }
 
@@ -162,7 +206,8 @@ public class MongoConnectorBuilder {
         checkIsNull(client, paramNotAllowed("Client", suffix));
         checkIsNull(dbName, paramNotAllowed("Database name", suffix));
         checkIsNull(uri, paramNotAllowed("URI", suffix));
-        checkServersCredsOptionsAreNull(suffix);
+        checkServerPropertiesAreNull(suffix);
+        checkConnectionOptionsAreNull(suffix);
     }
 
     private void validateForDatabase() throws SchedulerConfigException {
@@ -170,17 +215,19 @@ public class MongoConnectorBuilder {
         checkIsNull(client, paramNotAllowed("Client", suffix));
         checkIsNull(dbName, paramNotAllowed("Database name", suffix));
         checkIsNull(uri, paramNotAllowed("URI", suffix));
-        checkServersCredsOptionsAreNull(suffix);
+        checkServerPropertiesAreNull(suffix);
+        checkConnectionOptionsAreNull(suffix);
     }
 
     private void validateForClient() throws SchedulerConfigException {
         final String suffix = "'Client' parameter is used.";
         checkIsNull(uri, paramNotAllowed("URI", suffix));
-        checkServersCredsOptionsAreNull(suffix);
+        checkServerPropertiesAreNull(suffix);
+        checkConnectionOptionsAreNull(suffix);
     }
 
     private void validateForUri() throws SchedulerConfigException {
-        checkServersCredsOptionsAreNull("'URI' parameter is used.");
+        checkServerPropertiesAreNull("'URI' parameter is used.");
     }
 
     private static <T> T checkNotNull(final T reference, final String message) throws SchedulerConfigException {
@@ -196,19 +243,26 @@ public class MongoConnectorBuilder {
         }
     }
 
-    private void checkServersCredsOptionsAreNull(final String suffix) throws SchedulerConfigException {
+    private void checkServerPropertiesAreNull(final String suffix) throws SchedulerConfigException {
         checkIsNull(addresses, paramNotAllowed("Addresses array", suffix));
         checkIsNull(username, paramNotAllowed("Username", suffix));
         checkIsNull(password, paramNotAllowed("Password", suffix));
         checkIsNull(authDbName, paramNotAllowed("Auth database name", suffix));
-        checkIsNull(maxConnectionsPerHost, paramNotAllowed("Max connections per host", suffix));
+    }
+
+    private void checkConnectionOptionsAreNull(final String suffix) throws SchedulerConfigException {
+        checkIsNull(maxConnections, paramNotAllowed("Max connections", suffix));
         checkIsNull(connectTimeoutMillis, paramNotAllowed("Connect timeout millis", suffix));
-        checkIsNull(socketTimeoutMillis, paramNotAllowed("Socket timeout millis", suffix));
+        checkIsNull(readTimeoutMillis, paramNotAllowed("Socket timeout millis", suffix));
         checkIsNull(socketKeepAlive, paramNotAllowed("Socket keepAlive", suffix));
-        checkIsNull(threadsAllowedToBlockForConnectionMultiplier,
-                paramNotAllowed("Threads allowed to block for connection multiplier", suffix));
         checkIsNull(enableSSL, paramNotAllowed("Enable ssl", suffix));
         checkIsNull(sslInvalidHostNameAllowed, paramNotAllowed("SSL invalid hostname allowed", suffix));
+        checkIsNull(trustStorePath, paramNotAllowed("TrustStore path", suffix));
+        checkIsNull(trustStorePassword, paramNotAllowed("TrustStore password", suffix));
+        checkIsNull(trustStoreType, paramNotAllowed("TrustStore type", suffix));
+        checkIsNull(keyStorePath, paramNotAllowed("KeyStore path", suffix));
+        checkIsNull(keyStorePassword, paramNotAllowed("KeyStore password", suffix));
+        checkIsNull(keyStoreType, paramNotAllowed("KeyStore type", suffix));
     }
 
     private static String paramNotAllowed(final String paramName, final String suffix) {
@@ -222,8 +276,13 @@ public class MongoConnectorBuilder {
         return this;
     }
 
-    public MongoConnectorBuilder withWriteTimeout(int writeTimeout) {
-        this.writeTimeout = writeTimeout;
+    public MongoConnectorBuilder withWriteConcernWriteTimeout(int writeConcernWriteTimeout) {
+        this.writeConcernWriteTimeout = writeConcernWriteTimeout;
+        return this;
+    }
+
+    public MongoConnectorBuilder withWriteConcernW(String writeConcernW) {
+        this.writeConcernW = writeConcernW;
         return this;
     }
 
@@ -263,8 +322,8 @@ public class MongoConnectorBuilder {
         return this;
     }
 
-    public MongoConnectorBuilder withMaxConnectionsPerHost(final Integer maxConnectionsPerHost) {
-        this.maxConnectionsPerHost = maxConnectionsPerHost;
+    public MongoConnectorBuilder withMaxConnections(final Integer maxConnections) {
+        this.maxConnections = maxConnections;
         return this;
     }
 
@@ -273,8 +332,8 @@ public class MongoConnectorBuilder {
         return this;
     }
 
-    public MongoConnectorBuilder withSocketTimeoutMillis(final Integer socketTimeoutMillis) {
-        this.socketTimeoutMillis = socketTimeoutMillis;
+    public MongoConnectorBuilder withReadTimeoutMillis(final Integer readTimeoutMillis) {
+        this.readTimeoutMillis = readTimeoutMillis;
         return this;
     }
 
@@ -283,15 +342,24 @@ public class MongoConnectorBuilder {
         return this;
     }
 
-    public MongoConnectorBuilder withThreadsAllowedToBlockForConnectionMultiplier(
-            final Integer threadsAllowedToBlockForConnectionMultiplier) {
-        this.threadsAllowedToBlockForConnectionMultiplier = threadsAllowedToBlockForConnectionMultiplier;
-        return this;
-    }
-
     public MongoConnectorBuilder withSSL(final Boolean enableSSL, final Boolean sslInvalidHostNameAllowed) {
         this.enableSSL = enableSSL;
         this.sslInvalidHostNameAllowed = sslInvalidHostNameAllowed;
         return this;
     }
+
+    public MongoConnectorBuilder withTrustStore(String trustStorePath, String trustStorePassword, String trustStoreType) {
+        this.trustStorePath = trustStorePath;
+        this.trustStorePassword = trustStorePassword;
+        this.trustStoreType = trustStoreType;
+        return this;
+    }
+
+    public MongoConnectorBuilder withKeyStore(String keyStorePath, String keyStorePassword, String keyStoreType) {
+        this.keyStorePath = keyStorePath;
+        this.keyStorePassword = keyStorePassword;
+        this.keyStoreType = keyStoreType;
+        return this;
+    }
+
 }

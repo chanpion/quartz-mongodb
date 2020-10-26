@@ -5,6 +5,7 @@ import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.IndexOptions;
+import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.UpdateOptions;
 import com.novemberain.quartz.mongodb.Constants;
 import com.novemberain.quartz.mongodb.trigger.TriggerConverter;
@@ -67,13 +68,13 @@ public class TriggerDao {
     }
 
     public boolean exists(Bson filter) {
-        return triggerCollection.count(filter) > 0;
+        return triggerCollection.countDocuments(filter) > 0;
     }
 
     public FindIterable<Document> findEligibleToRun(Date noLaterThanDate) {
         Bson query = createNextTriggerQuery(noLaterThanDate);
         if (log.isInfoEnabled()) {
-            log.info("Found {} triggers which are eligible to be run.", getCount(query));
+            log.debug("Found {} triggers which are eligible to be run.", getCount(query));
         }
         return triggerCollection.find(query).sort(ascending(Constants.TRIGGER_NEXT_FIRE_TIME));
     }
@@ -83,7 +84,7 @@ public class TriggerDao {
     }
 
     public int getCount() {
-        return (int) triggerCollection.count();
+        return (int) triggerCollection.countDocuments();
     }
 
     public List<String> getGroupNames() {
@@ -152,7 +153,7 @@ public class TriggerDao {
     }
 
     public void replace(TriggerKey triggerKey, Document trigger) {
-        triggerCollection.replaceOne(toFilter(triggerKey), trigger);
+        triggerCollection.replaceOne(toFilter(triggerKey), trigger, new ReplaceOptions().upsert(true));
     }
 
     public void setState(TriggerKey triggerKey, String state) {
@@ -208,7 +209,7 @@ public class TriggerDao {
     }
 
     private long getCount(Bson query) {
-        return triggerCollection.count(query);
+        return triggerCollection.countDocuments(query);
     }
 
     private void setStates(Bson filter, String state) {

@@ -114,6 +114,19 @@ public class TriggerStateManager {
         return groups;
     }
 
+    public void resetTriggerFromErrorState(TriggerKey triggerKey) {
+        // Atomic updates cannot be done with the current model - across collections.
+        String currentState = triggerDao.getState(triggerKey);
+        if (!Constants.STATE_ERROR.equals(currentState)) {
+            return;
+        }
+        String newState = Constants.STATE_WAITING;
+        if (pausedTriggerGroupsDao.getPausedGroups().contains(triggerKey.getGroup())) {
+            newState = Constants.STATE_PAUSED;
+        }
+        triggerDao.transferState(triggerKey, Constants.STATE_ERROR, newState);
+    }
+
     private TriggerState getTriggerState(String value) {
         if (value == null) {
             return TriggerState.NONE;

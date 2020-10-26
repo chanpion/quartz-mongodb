@@ -84,20 +84,19 @@ public class MongoStoreAssembler {
     private CheckinExecutor createCheckinExecutor(MongoDBJobStore jobStore, ClassLoadHelper loadHelper,
                                                   Properties quartzProps)
         throws ClassNotFoundException, InstantiationException, IllegalAccessException {
-        return new CheckinExecutor(createCheckinTask(loadHelper, quartzProps),
+        return new CheckinExecutor(createCheckinTask(jobStore, loadHelper),
                 jobStore.clusterCheckinIntervalMillis, jobStore.instanceId);
     }
 
-    private Runnable createCheckinTask(ClassLoadHelper loadHelper, Properties quartzProps)
+    private Runnable createCheckinTask(MongoDBJobStore jobStore, ClassLoadHelper loadHelper)
         throws ClassNotFoundException, IllegalAccessException, InstantiationException {
         Runnable errorHandler;
-        String className = quartzProps.getProperty("org.quartz.jobStore.checkInErrorHandler.class");
         Class aClass;
-        if (className == null) {
-            // current default, see 
+        if (jobStore.getCheckInErrorHandler() == null) {
+            // current default, see
             aClass = KamikazeErrorHandler.class;
         } else {
-            aClass = loadHelper.loadClass(className);
+            aClass = loadHelper.loadClass(jobStore.getCheckInErrorHandler());
         }
         errorHandler = (Runnable) aClass.newInstance();
         return new CheckinTask(schedulerDao, errorHandler);
@@ -122,7 +121,7 @@ public class MongoStoreAssembler {
 
     private LockManager createLockManager(MongoDBJobStore jobStore) {
         ExpiryCalculator expiryCalculator = new ExpiryCalculator(schedulerDao,
-                Clock.SYSTEM_CLOCK, jobStore.jobTimeoutMillis, jobStore.triggerTimeoutMillis);
+                Clock.SYSTEM_CLOCK, jobStore.jobTimeoutMillis, jobStore.triggerTimeoutMillis,jobStore.isClustered());
         return new LockManager(locksDao, expiryCalculator);
     }
 
@@ -140,14 +139,15 @@ public class MongoStoreAssembler {
                 .withAddresses(jobStore.addresses)
                 .withDatabaseName(jobStore.dbName)
                 .withAuthDatabaseName(jobStore.authDbName)
-                .withMaxConnectionsPerHost(jobStore.mongoOptionMaxConnectionsPerHost)
+                .withMaxConnections(jobStore.mongoOptionMaxConnections)
                 .withConnectTimeoutMillis(jobStore.mongoOptionConnectTimeoutMillis)
-                .withSocketTimeoutMillis(jobStore.mongoOptionSocketTimeoutMillis)
+                .withReadTimeoutMillis(jobStore.mongoOptionReadTimeoutMillis)
                 .withSocketKeepAlive(jobStore.mongoOptionSocketKeepAlive)
-                .withThreadsAllowedToBlockForConnectionMultiplier(
-                        jobStore.mongoOptionThreadsAllowedToBlockForConnectionMultiplier)
                 .withSSL(jobStore.mongoOptionEnableSSL, jobStore.mongoOptionSslInvalidHostNameAllowed)
-                .withWriteTimeout(jobStore.mongoOptionWriteConcernTimeoutMillis)
+                .withTrustStore(jobStore.mongoOptionTrustStorePath, jobStore.mongoOptionTrustStorePassword, jobStore.mongoOptionTrustStoreType)
+                .withKeyStore(jobStore.mongoOptionKeyStorePath, jobStore.mongoOptionKeyStorePassword, jobStore.mongoOptionKeyStoreType)
+                .withWriteConcernWriteTimeout(jobStore.mongoOptionWriteConcernTimeoutMillis)
+                .withWriteConcernW(jobStore.mongoOptionWriteConcernW)
                 .build();
     }
 
